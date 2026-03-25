@@ -1,5 +1,3 @@
-.github/workflows/deploy.yml
-```yaml
 name: Deploy Spring Boot to EC2 Docker
 
 on:
