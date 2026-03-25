@@ -1,0 +1,156 @@
+---
+- name: Deploy Spring Boot application (Docker)
+  hosts: all
+  become: yes
+
+  vars:
+    app_dir: /opt/app
+    app_port: 8080
+    java_version: "17"
+
+  tasks:
+    - name: Install dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repo
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu jammy stable"
+        state: present
+
+    - name: Install Docker CE
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Start and enable Docker
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add ubuntu user to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    - name: Reset SSH connection so group change takes effect
+      meta: reset_connection
+
+    - name: Wipe old app files to prevent stale file serving
+      file:
+        path: "{{ app_dir }}"
+        state: absent
+      ignore_errors: yes
+
+    - name: Recreate app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Copy all project files to server
+      copy:
+        src: ../
+        dest: "{{ app_dir }}/"
+        mode: "0755"
+
+    - name: Copy compiled JAR into app directory
+      copy:
+        src: "jar/{{ jar_name }}"
+        dest: "{{ app_dir }}/app.jar"
+        mode: "0644"
+
+    - name: Verify JAR was copied
+      stat:
+        path: "{{ app_dir }}/app.jar"
+      register: jar_stat
+
+    - name: Fail if JAR missing
+      fail:
+        msg: "JAR not found at {{ app_dir }}/app.jar — copy step may have failed. jar_name={{ jar_name }}"
+      when: not jar_stat.stat.exists
+
+    - name: Write Dockerfile for Spring Boot
+      copy:
+        dest: "{{ app_dir }}/Dockerfile"
+        mode: "0644"
+        content: |
+          FROM eclipse-temurin:17-jre
+          WORKDIR /app
+          COPY app.jar app.jar
+          EXPOSE 8080
+          ENTRYPOINT ["java", "-jar", "app.jar"]
+
+    - name: Stop existing container
+      shell: docker stop app || true
+
+    - name: Remove existing container
+      shell: docker rm app || true
+
+    - name: Remove old image to force rebuild
+      shell: docker rmi app:latest || true
+
+    - name: Build Docker image
+      shell: docker build --no-cache -t app:latest {{ app_dir }}
+
+    - name: Run Docker container
+      shell: >
+        docker run -d
+        --name app
+        -p 80:8080
+        --restart always
+        {% if spring_datasource_url is defined and spring_datasource_url %}
+        -e SPRING_DATASOURCE_URL='{{ spring_datasource_url }}'
+        -e SPRING_DATASOURCE_USERNAME='{{ spring_datasource_username | default('') }}'
+        -e SPRING_DATASOURCE_PASSWORD='{{ spring_datasource_password | default('') }}'
+        {% endif %}
+        {% if spring_data_mongodb_uri is defined and spring_data_mongodb_uri %}
+        -e SPRING_DATA_MONGODB_URI='{{ spring_data_mongodb_uri }}'
+        {% endif %}
+        {% if spring_profiles_active is defined and spring_profiles_active %}
+        -e SPRING_PROFILES_ACTIVE='{{ spring_profiles_active }}'
+        {% endif %}
+        app:latest
+
+    - name: Wait for container to be ready
+      pause:
+        seconds: 15
+
+    - name: Verify container is running
+      shell: docker ps --filter name=app --filter status=running --format '{{ '{{' }}.Names{{ '}}' }}'
+      register: container_check
+      retries: 3
+      delay: 5
+      until: container_check.stdout != ""
+      become: yes
+
+    - name: Fail if container is not running
+      fail:
+        msg: "Container 'app' is not running after deployment. Check docker logs app for details."
+      when: container_check.stdout == ""
+
+    - name: Report server IP
+      debug:
+        msg: "server_ip={{ ansible_host }}"
+
+    - name: Report deployment success
+      debug:
+        msg: "Spring Boot deployed successfully inside Docker. Live at http://{{ ansible_host }}/"
